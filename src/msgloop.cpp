@@ -1,3 +1,11 @@
+//============================================================================
+// Name        : msgloop.cpp
+// Author      : Stefan Gao (stefan.gao@gmail.com)
+// Version     :
+// Copyright   : Your copyright notice
+// Description :
+//============================================================================
+
 #include <iostream>
 #include <thread>
 #include <mutex>
@@ -6,22 +14,25 @@
 #include <list>
 #include <vector>
 #include <string.h>
+#include "msgloop.h"
 
-typedef std::function<void(void*)> llCallbackFunc;
+namespace llshell {
 
 typedef struct _Msg
 {
-    llCallbackFunc callback;
-    void* data;
+    MsgCallbackFunc callback;
+    const void* data;
+    int id;
 } MsgInfo;
 
 typedef struct _TimerMsg
 {
-    llCallbackFunc callback;
+    MsgCallbackFunc callback;
     int interval;
     std::chrono::system_clock::time_point timepoint;
     bool once;
     int id;
+    const void* userData;
 } TimerInfo;
 
 static std::mutex gMainMtx;
@@ -34,42 +45,61 @@ static bool gFinished = false;
 
 static std::queue<MsgInfo> gMsgQueue;
 static std::list<TimerInfo> gTimerList;
+static int gNextTimerId = 0;
 
-void postMsg(const MsgInfo& msg)
+static void postMsg(const MsgInfo& msg)
 {
     std::unique_lock < std::mutex > lck(gMainMtx);
     gMsgQueue.push(msg);
     gMainCv.notify_one();
+    lck.unlock();
 }
 
-void postCallback(std::function<void(void*)> func)
+void postCallback(const void* userData, const MsgCallbackFunc& func)
 {
     MsgInfo msg;
-    msg.data = nullptr;
+    msg.id = 0;
+    msg.data = userData;
     msg.callback = func;
     postMsg(msg);
 }
 
-void setTimer(int interval, bool once, std::function<void(void*)> func)
+int setTimer(int interval, const MsgCallbackFunc& func, const void* userData, bool once)
 {
     TimerInfo timer;
     timer.interval = interval;
     timer.timepoint = std::chrono::system_clock::now()
             + std::chrono::milliseconds(interval);
     timer.once = once;
-    timer.id = 0;
+    timer.id = gNextTimerId++;
+    timer.userData = userData;
     timer.callback = func;
 
     std::unique_lock < std::mutex > lck(gTimerMtx);
     gTimerList.push_back(timer);
     gTimerCv.notify_one();
+    return timer.id;
+}
+
+bool killTimer(int tid)
+{
+    for (auto iter = gTimerList.begin(); iter != gTimerList.end(); iter++)
+    {
+        if (tid == (*iter).id)
+        {
+            gTimerList.erase(iter);
+            gTimerCv.notify_one();
+            return true;
+        }
+    }
+    return false;
 }
 
 static void exitApp()
 {
     gFinished = true;
     gTimerCv.notify_one();
-    postCallback(nullptr);
+    postCallback(nullptr, nullptr);
 }
 
 static void do_timer_thread()
@@ -97,7 +127,8 @@ static void do_timer_thread()
             if (cvsts == std::cv_status::timeout)
             {
                 MsgInfo msg;
-                msg.data = nullptr;
+                msg.data = timerInfo.userData;
+                msg.id = timerInfo.id;
                 msg.callback = timerInfo.callback;
                 postMsg(msg);
                 if (!timerInfo.once)
@@ -166,13 +197,35 @@ static void onCommand(const std::string& cmd, std::vector<std::string> params)
                 once = atoi(params[1].c_str());
 
             auto timeStart = std::chrono::system_clock::now();
-            //std::cout << interval << "," << once << std::endl;
-            setTimer(interval, once, [timeStart](void* p)
+            int tid = setTimer(interval, [timeStart](int id, const void* p)
                     {
                         auto timeEnd = std::chrono::system_clock::now();
                         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(timeEnd - timeStart);
-                        std::cout << "---time out---" << duration.count() << "\n";
+                        std::cout << "---time out[" << id << "]---" << duration.count() << "\n";
+                    }, nullptr, once);
+            std::cout << "setTimer" << "[" << tid << "]:" << interval << "," << once << std::endl;
+        }
+    }
+    else if (cmd == "p")
+    {
+        int num = params.size();
+        if (num > 0)
+        {
+            long userData = atol(params[0].c_str());
+            postCallback((const void*)userData, [](int, const void* userData)
+                    {
+                        long value = (long)userData;
+                        std::cout << "postCallback: userData=" << "(" << value << ")"<< std::endl;
                     });
+        }
+    }
+    else if (cmd == "k")
+    {
+        int num = params.size();
+        if (num > 0)
+        {
+            int tid = atoi(params[0].c_str());
+            killTimer(tid);
         }
     }
     else if (cmd == "exit")
@@ -206,30 +259,34 @@ static void do_input_thread()
     std::cout << "input thread exit\n";
 }
 
-int main()
+int run_msgloop()
 {
-    std::cout << "main start\n";
+    std::cout << "msgloop start..." << std::endl;
     std::thread timerThread, inputThread;
     timerThread = std::thread(do_timer_thread);
     inputThread = std::thread(do_input_thread);
-    std::unique_lock < std::mutex > lck(gMainMtx);
 
     while (!gFinished)
     {
+        std::unique_lock <std::mutex> lck(gMainMtx);
         gMainCv.wait(lck, []{return gMsgQueue.size() > 0;});
-
-        while (gMsgQueue.size() > 0)
+        int msgNum = gMsgQueue.size();
+        if (msgNum > 0)
         {
-            MsgInfo& msg = gMsgQueue.front();
-            if (msg.callback)
-                msg.callback(msg.data);
-
+            MsgInfo msg = gMsgQueue.front();
             gMsgQueue.pop();
+            lck.unlock();
+
+            if (msg.callback)
+                msg.callback(msg.id, msg.data);
         }
+
     }
     timerThread.join();
     inputThread.join();
 
-    std::cout << "main exit\n";
+    std::cout << "msgloop exit..." << std::endl;
     return 0;
 }
+
+} //namespace llshell end
